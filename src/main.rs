@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ethers::{
     prelude::{k256::ecdsa::SigningKey, SignerMiddleware, U256},
     providers::{Middleware, Provider, StreamExt, Ws},
@@ -6,15 +6,11 @@ use ethers::{
     types::{Address, BlockId, BlockNumber, Eip1559TransactionRequest, TransactionRequest},
     utils::parse_units,
 };
-use futures::stream::{self, TryStreamExt};
+use futures::future::try_join_all;
 use rand::Rng;
 use sha3::{Digest, Sha3_256};
 use std::{
     str::FromStr,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +34,10 @@ const DATA_SIZE: usize = 131072;
 /// How frequent to update the transaction rate
 const TX_RATE_UPDATE_EVERY_BLOCKS: usize = 1;
 const MAX_BLOCK_GAS: usize = 30_000_000;
+const ONE_GWEI: f64 = 1_000_000_000.;
+/// Transactions must be bumped by at least 10% to be re-accepted into the mempool
+const MIN_GAS_FACTOR_BUMP: f64 = 1.2;
+const MIN_GAS_PRIO_FEE: f64 = 10. * ONE_GWEI;
 
 // Target for each account to submit one transaction per block
 // On every block:
@@ -95,27 +95,23 @@ async fn main() -> Result<()> {
         );
     }
 
+    send_transactions_to_self(&wallets).await?;
+    println!("sent check transactions from all wallets");
+
     // Persist initial nonces, to estimate load
     let initial_block_number = provider.get_block_number().await?.as_usize();
-    let mut addresses_with_init_nonce = vec![];
-    for address in addresses.iter() {
-        let nonce = provider
-            .get_transaction_count(
-                *address,
-                Some(BlockId::Number(BlockNumber::Number(
-                    initial_block_number.into(),
-                ))),
-            )
-            .await?
-            .as_usize();
-        addresses_with_init_nonce.push((nonce, *address));
-    }
+    let initial_nonces = get_nonces(
+        &provider,
+        &addresses,
+        BlockId::Number(BlockNumber::Number(initial_block_number.into())),
+    )
+    .await?;
 
     // Prevent sending transations again for the same height on re-orgs
     let mut transactions_sent_last_for_block = initial_block_number;
     let mut blobs_per_block: usize = target_blobs_per_block;
     let mut last_tx_rate_update_block = initial_block_number;
-    let nonce_delta_last_block = Arc::new(AtomicUsize::new(0));
+    let mut last_send_tx_by_wallet: Vec<Option<(usize, f64)>> = vec![None; max_active_accounts];
 
     let mut stream = provider.subscribe_blocks().await?;
     while let Some(block) = stream.next().await {
@@ -123,79 +119,118 @@ async fn main() -> Result<()> {
         let since_block = duration_since_timestamp_sec(timestamp);
         let block_number = block.number.unwrap().as_usize();
         let block_hash = block.hash.unwrap();
-        println!(
-            "Ts: {:?} {:?}, block number: {} -> {:?}, gas used: {} {}%",
-            timestamp,
-            since_block,
-            block_number,
-            block_hash,
-            block.gas_used,
-            (100 * block.gas_used.as_usize()) / MAX_BLOCK_GAS
-        );
+        let block_base_fee = block.base_fee_per_gas.unwrap().as_u64();
 
         // Prevent sending transations again for the same height on re-orgs
         if block_number > transactions_sent_last_for_block {
             transactions_sent_last_for_block = block_number;
 
+            let nonces = get_nonces(&provider, &addresses, BlockId::Hash(block_hash)).await?;
+            let nonce_delta: usize = nonces
+                .iter()
+                .zip(&initial_nonces)
+                .map(|(nonce, init_nonce)| nonce - init_nonce)
+                .sum();
+            let tx_rate = nonce_delta as f64 / (block_number - initial_block_number) as f64;
+
             // Compute how many accounts should _attempt_ to include transactions in this block
             if block_number > last_tx_rate_update_block + TX_RATE_UPDATE_EVERY_BLOCKS {
                 last_tx_rate_update_block = block_number;
-                let recent_tx_rate = nonce_delta_last_block.load(Ordering::Relaxed) as f64
-                    / (block_number - initial_block_number) as f64;
-                if recent_tx_rate > target_blobs_per_block as f64 {
+                if tx_rate > target_blobs_per_block as f64 {
                     blobs_per_block = blobs_per_block.saturating_sub(1);
                 } else {
                     blobs_per_block = std::cmp::min(blobs_per_block + 1, max_active_accounts);
                 }
                 println!(
                     "Measured tx rate: {}, updating rate to {}",
-                    recent_tx_rate, blobs_per_block
+                    tx_rate, blobs_per_block
                 );
             }
 
+            println!(
+                "Block event {} {}, arrived: {:?} late {:?}, gas used: {} {}% | measured tx rate: {} broadcast rate: {}",
+                block_number,
+                block_hash,
+                timestamp,
+                since_block,
+                block.gas_used,
+                (100 * block.gas_used.as_usize()) / MAX_BLOCK_GAS,
+                tx_rate,
+                blobs_per_block,
+            );
+
             for i in 0..blobs_per_block {
                 let wallet = wallets.get(i).unwrap().clone();
+                let nonce = nonces.get(i).unwrap().clone();
+
+                let last_sent_factor = match last_send_tx_by_wallet.get(i).unwrap() {
+                    Some((last_sent_nonce, factor)) => {
+                        if *last_sent_nonce == nonce {
+                            println!("resending transaction from account {} factor {}", i, factor);
+                            Some(factor)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                let factor = match last_sent_factor {
+                    Some(factor) => factor * MIN_GAS_FACTOR_BUMP,
+                    None => 1.,
+                };
+                *last_send_tx_by_wallet.get_mut(i).unwrap() = Some((nonce, factor));
+
                 // 131072 bytes * 16 gas / byte + 21_000 = 2118152 gas
                 // * 20Gwei per gas = 42363040000000000 wei = 0.042 ETH
+                let max_base_fee = (factor * 1.25 * block_base_fee as f64) as u64;
+                let max_prio_fee = (factor * MIN_GAS_PRIO_FEE) as u64;
                 tokio::spawn(async move {
                     let tx = Eip1559TransactionRequest::new()
                         .to(target_address)
                         .value(0)
                         .from(wallet.address())
                         .data(get_random_data())
-                        .max_priority_fee_per_gas(20_000_000_000_u64)
-                        .max_fee_per_gas(2_000_000_000);
+                        .nonce(nonce)
+                        .max_priority_fee_per_gas(max_prio_fee)
+                        .max_fee_per_gas(max_base_fee + max_prio_fee);
 
-                    let tx = wallet
-                        .send_transaction(tx, None)
-                        .await
-                        .unwrap()
+                    let mut tx = tx.into();
+                    // fill any missing fields
+                    wallet
+                        .fill_transaction(&mut tx, Some(BlockId::Hash(block_hash)))
                         .await
                         .unwrap();
-                    println!("confirmed tx in block {:?}", tx.map(|tx| tx.block_number));
+
+                    // if we have a nonce manager set, we should try handling the result in
+                    // case there was a nonce mismatch
+                    let signature = wallet
+                        .sign_transaction(&tx, wallet.address())
+                        .await
+                        .unwrap();
+                    let signed_tx = tx.rlp_signed(&signature);
+
+                    // Submit the raw transaction
+                    let tx = match wallet.send_raw_transaction(signed_tx.into()).await {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            return eprintln!(
+                                "Error sending tx: {:?}\n{:?}",
+                                e,
+                                tx.set_data([].into())
+                            )
+                        }
+                    };
+
+                    let tx = tx.await.unwrap();
+                    println!(
+                        "confirmed tx in block {:?} sent after block {}",
+                        tx.map(|tx| tx.block_number),
+                        block_number
+                    );
                 });
             }
-
-            // Lazily update nonce_delta since getting the exact value is not necessary
-            let parent_wallet = parent_wallet.clone();
-            let addresses_with_init_nonce = addresses_with_init_nonce.clone();
-            let nonce_delta_last_block = nonce_delta_last_block.clone();
-            tokio::spawn(async move {
-                let block_number_delta = block_number - initial_block_number;
-                let nonce_delta = get_nonce_delta(
-                    &parent_wallet,
-                    &addresses_with_init_nonce,
-                    BlockId::Hash(block_hash),
-                )
-                .await
-                .unwrap();
-                nonce_delta_last_block.store(nonce_delta, Ordering::Relaxed);
-                let tx_rate = nonce_delta as f64 / block_number_delta as f64;
-                println!(
-                    "nonce_delta {} in blocks {} rate {} - block {} {}",
-                    nonce_delta, block_number_delta, tx_rate, block_hash, block_number
-                )
-            });
+        } else {
+            println!("Block event {} {}, re-orged", block_number, block_hash,);
         }
     }
 
@@ -255,26 +290,49 @@ async fn fund_account_up_to(
     Ok(())
 }
 
-async fn get_nonce_delta(
-    parent_wallet: &SignerMiddleware<Provider<Ws>, LocalWallet>,
-    addresses_with_init_nonce: &[(usize, Address)],
+async fn get_nonces(
+    provider: &Provider<Ws>,
+    addresses: &[Address],
     block: BlockId,
-) -> Result<usize> {
-    let nonce_delta = Arc::new(AtomicUsize::new(0));
-
-    stream::iter(addresses_with_init_nonce.iter().map(Ok))
-        .try_for_each_concurrent(10, |(init_nonce, address)| {
-            let nonce_delta = nonce_delta.clone();
-            async move {
-                let nonce = parent_wallet
+) -> Result<Vec<usize>> {
+    try_join_all(
+        addresses
+            .iter()
+            .map(|address| async move {
+                let nonce = provider
                     .get_transaction_count(*address, Some(block))
-                    .await
-                    .context("Failed to get transaction count")?;
-                nonce_delta.fetch_add(nonce.as_usize() - init_nonce, Ordering::Relaxed);
-                Ok::<_, anyhow::Error>(())
-            }
-        })
-        .await?;
+                    .await?;
+                Ok(nonce.as_usize())
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await
+}
 
-    Ok(nonce_delta.load(Ordering::Relaxed))
+async fn send_transactions_to_self(
+    wallets: &[SignerMiddleware<Provider<Ws>, LocalWallet>],
+) -> Result<()> {
+    try_join_all(
+        wallets
+            .iter()
+            .map(|wallet| async move {
+                let tx = Eip1559TransactionRequest::new()
+                    .to(wallet.address())
+                    .value(0)
+                    .from(wallet.address())
+                    .data(get_random_data());
+
+                let _ = wallet
+                    .send_transaction(tx, None)
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+
+                Ok::<_, anyhow::Error>(())
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    Ok(())
 }
