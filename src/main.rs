@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
         fund_account_up_to(&parent_wallet, *address, target_balance, min_balance).await?;
         println!(
             "funded account 0x{} with {} wei",
-            hex::encode(&address.to_fixed_bytes()),
+            hex::encode(address.to_fixed_bytes()),
             min_balance
         );
     }
@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
 
             for i in 0..blobs_per_block {
                 let wallet = wallets.get(i).unwrap().clone();
-                let nonce = nonces.get(i).unwrap().clone();
+                let nonce = *nonces.get(i).unwrap();
 
                 let last_sent_factor = match last_send_tx_by_wallet.get(i).unwrap() {
                     Some((last_sent_nonce, factor)) => {
@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
                     let signed_tx = tx.rlp_signed(&signature);
 
                     // Submit the raw transaction
-                    let tx = match wallet.send_raw_transaction(signed_tx.into()).await {
+                    let tx = match wallet.send_raw_transaction(signed_tx).await {
                         Ok(tx) => tx,
                         Err(e) => {
                             return eprintln!(
