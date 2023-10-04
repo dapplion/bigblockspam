@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.75"
 bytes = "1.4.0"
+dotenv = "0.15.0"
 ethers = { version = "2.0.9", features = ["ws"] }
 futures = "0.3.28"
 hex = "0.4.3"

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use dotenv::dotenv;
 use ethers::{
     prelude::{k256::ecdsa::SigningKey, SignerMiddleware, U256},
     providers::{Middleware, Provider, StreamExt, Ws},
@@ -9,14 +10,14 @@ use ethers::{
 use futures::future::try_join_all;
 use rand::Rng;
 use sha3::{Digest, Sha3_256};
+use std::env;
 use std::{
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const RPC_URL_WS: &str = "wss://rpc.gnosischain.com/wss";
+const RPC_URL_WS_DEFAULT: &str = "wss://rpc.gnosischain.com/wss";
 
-const PRIVKEY: &str = "040fff5339f9cb617826a40de1d8c6af978eb9aff246c20153c105b655defb42";
 // From some tests, the network can easily accept tx with 129kB of data. Above that it strugles for
 // inclusion. A single Blob is BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_BLOB = 32 * 4096 = 131072
 //
@@ -47,18 +48,26 @@ const MIN_GAS_PRIO_FEE: f64 = 10. * ONE_GWEI;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let target_blobs_per_block = 4;
-    let max_active_accounts = 12;
+    // Auto-load .env file
+    dotenv().ok();
+
+    // Read constants from environment variables
+    let rpc_url_ws: String =
+        env::var("RPC_URL_WS").unwrap_or_else(|_| RPC_URL_WS_DEFAULT.to_string());
+    let privkey: String = env::var("PRIVKEY").unwrap();
+
+    let target_blobs_per_block = 12;
+    let max_active_accounts = 24;
     let target_balance: U256 = parse_units("1.0", "ether").unwrap().into();
     let min_balance: U256 = parse_units("0.8", "ether").unwrap().into();
     let target_address = Address::from_str("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
 
-    let provider = Provider::<Ws>::connect(RPC_URL_WS).await?;
+    let provider = Provider::<Ws>::connect(&rpc_url_ws).await?;
     let chain_id = provider.get_chainid().await?.as_u128() as u64;
 
     // connect the wallet to the provider
     let parent_signing_key =
-        SigningKey::from_bytes(hex::decode(PRIVKEY).unwrap().as_slice().into()).unwrap();
+        SigningKey::from_bytes(hex::decode(privkey).unwrap().as_slice().into()).unwrap();
     let parent_wallet = SignerMiddleware::new(
         provider.clone(),
         LocalWallet::from(parent_signing_key.clone()).with_chain_id(chain_id),
@@ -66,7 +75,7 @@ async fn main() -> Result<()> {
 
     println!(
         "connected to {} chain_id {} with parent account {}",
-        RPC_URL_WS,
+        rpc_url_ws,
         chain_id,
         parent_wallet.address()
     );
