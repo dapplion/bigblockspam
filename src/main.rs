@@ -56,9 +56,12 @@ async fn main() -> Result<()> {
     let rpc_url_ws: String =
         env::var("RPC_URL_WS").unwrap_or_else(|_| RPC_URL_WS_DEFAULT.to_string());
     let privkey: String = env::var("PRIVKEY").unwrap();
+    let skip_funding = env::var("SKIP_FUNDING").is_ok();
 
-    let target_blobs_per_block = 4;
-    let max_active_accounts = 34;
+    let target_blobs_per_block = 3;
+    let max_active_accounts = 15;
+    let wallet_offset = 17;
+
     let target_balance: U256 = parse_units("2.0", "ether").unwrap().into();
     let min_balance: U256 = parse_units("1.5", "ether").unwrap().into();
     let target_address = Address::from_str("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
@@ -82,7 +85,7 @@ async fn main() -> Result<()> {
     );
 
     // Compute sender accounts
-    let wallets = (0..max_active_accounts)
+    let wallets = (wallet_offset..wallet_offset + max_active_accounts)
         .map(|i| {
             let pk = derive_privkey_from_parent(&parent_signing_key, i);
             let wallet = LocalWallet::from(pk);
@@ -96,13 +99,17 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     // Fund all sender accounts
-    for address in addresses.iter() {
-        fund_account_up_to(&parent_wallet, *address, target_balance, min_balance).await?;
-        println!(
-            "funded account 0x{} with at least {} wei",
-            hex::encode(address.to_fixed_bytes()),
-            min_balance
-        );
+    if skip_funding {
+        println!("Skipping funding accounts");
+    } else {
+        for address in addresses.iter() {
+            fund_account_up_to(&parent_wallet, *address, target_balance, min_balance).await?;
+            println!(
+                "funded account 0x{} with at least {} wei",
+                hex::encode(address.to_fixed_bytes()),
+                min_balance
+            );
+        }
     }
 
     send_transactions_to_self(&wallets).await?;
