@@ -10,7 +10,7 @@ use ethers::{
 use futures::future::try_join_all;
 use rand::Rng;
 use sha3::{Digest, Sha3_256};
-use std::env;
+use std::{collections::BTreeMap, env};
 use std::{
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -39,6 +39,7 @@ const ONE_GWEI: f64 = 1_000_000_000.;
 /// Transactions must be bumped by at least 10% to be re-accepted into the mempool
 const MIN_GAS_FACTOR_BUMP: f64 = 1.2;
 const MIN_GAS_PRIO_FEE: f64 = 10. * ONE_GWEI;
+const MAX_NONCE_ENTRIES: usize = 10;
 
 // Target for each account to submit one transaction per block
 // On every block:
@@ -56,10 +57,10 @@ async fn main() -> Result<()> {
         env::var("RPC_URL_WS").unwrap_or_else(|_| RPC_URL_WS_DEFAULT.to_string());
     let privkey: String = env::var("PRIVKEY").unwrap();
 
-    let target_blobs_per_block = 12;
-    let max_active_accounts = 24;
-    let target_balance: U256 = parse_units("1.0", "ether").unwrap().into();
-    let min_balance: U256 = parse_units("0.8", "ether").unwrap().into();
+    let target_blobs_per_block = 4;
+    let max_active_accounts = 34;
+    let target_balance: U256 = parse_units("2.0", "ether").unwrap().into();
+    let min_balance: U256 = parse_units("1.5", "ether").unwrap().into();
     let target_address = Address::from_str("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
 
     let provider = Provider::<Ws>::connect(&rpc_url_ws).await?;
@@ -98,7 +99,7 @@ async fn main() -> Result<()> {
     for address in addresses.iter() {
         fund_account_up_to(&parent_wallet, *address, target_balance, min_balance).await?;
         println!(
-            "funded account 0x{} with {} wei",
+            "funded account 0x{} with at least {} wei",
             hex::encode(address.to_fixed_bytes()),
             min_balance
         );
@@ -115,6 +116,8 @@ async fn main() -> Result<()> {
         BlockId::Number(BlockNumber::Number(initial_block_number.into())),
     )
     .await?;
+    let mut prev_nonces = PrevNonces::default();
+    prev_nonces.insert(initial_block_number, initial_nonces.clone());
 
     // Prevent sending transations again for the same height on re-orgs
     let mut transactions_sent_last_for_block = initial_block_number;
@@ -135,9 +138,17 @@ async fn main() -> Result<()> {
             transactions_sent_last_for_block = block_number;
 
             let nonces = get_nonces(&provider, &addresses, BlockId::Hash(block_hash)).await?;
+
+            // Persist nonces
+            prev_nonces.insert(block_number, nonces.clone());
+            // Retrieve nonces from some pre-defined distance
+            let nonces_at_some_distance = prev_nonces
+                .get_oldest()
+                .unwrap_or_else(|| initial_nonces.clone());
+
             let nonce_delta: usize = nonces
                 .iter()
-                .zip(&initial_nonces)
+                .zip(nonces_at_some_distance)
                 .map(|(nonce, init_nonce)| nonce - init_nonce)
                 .sum();
             let tx_rate = nonce_delta as f64 / (block_number - initial_block_number) as f64;
@@ -244,6 +255,38 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct PrevNonces {
+    nonces: BTreeMap<usize, Vec<usize>>,
+}
+
+impl PrevNonces {
+    pub fn insert(&mut self, k: usize, v: Vec<usize>) {
+        self.nonces.insert(k, v);
+        self.prune();
+    }
+
+    pub fn get_oldest(&mut self) -> Option<Vec<usize>> {
+        self.nonces.first_entry().map(|e| e.get().clone())
+    }
+
+    fn prune(&mut self) {
+        let highest_key = if let Some((highest_key, _)) = self.nonces.last_key_value() {
+            *highest_key
+        } else {
+            return;
+        };
+
+        while let Some(entry) = self.nonces.first_entry() {
+            if *entry.key() < highest_key - MAX_NONCE_ENTRIES {
+                entry.remove();
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 fn get_random_data() -> Vec<u8> {
